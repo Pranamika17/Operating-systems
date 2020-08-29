@@ -1,0 +1,8 @@
+The scheduling algorithm that I have implemented is shortest job first.This is a  simple algorithm where the process with the least run time is picked up next ie the process with the highest runtime is executed at the very end.
+
+
+So,in the test program I have spawned 16 processes and have assigned a running time to each of them based on their process id.Running time is assigned such that the earlier process has a greater running time.
+For eg: child 0 has a greater running time than child 1 and child 1 has a greater running time than child 2.
+So,as seen in the screenshot attached ,after all the process are spawned ,the process 15 which has the lowest running time is picked up followed by process 14 and so on.
+So,process 1 followed by process 0 are executed at  the very end.
+

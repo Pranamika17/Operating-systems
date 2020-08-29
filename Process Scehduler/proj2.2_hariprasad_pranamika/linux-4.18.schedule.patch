@@ -1,0 +1,283 @@
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 887d3a7..d79d793 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -2937,6 +2937,12 @@ config X86_DMA_REMAP
+ config HAVE_GENERIC_GUP
+ 	def_bool y
+ 
++menu "SJF schduler"
++config SCHED_SJF_POLICY
++       bool "enable SJF scheduler"
++       default y
++endmenu
++
+ source "net/Kconfig"
+ 
+ source "drivers/Kconfig"
+diff --git a/fs/proc/Makefile b/fs/proc/Makefile
+index ead487e..60284da 100644
+--- a/fs/proc/Makefile
++++ b/fs/proc/Makefile
+@@ -27,6 +27,7 @@ proc-y	+= softirqs.o
+ proc-y	+= namespaces.o
+ proc-y	+= self.o
+ proc-y	+= thread_self.o
++proc-$(CONFIG_SCHED_SJF_POLICY)      += proc_sjf.o
+ proc-$(CONFIG_PROC_SYSCTL)	+= proc_sysctl.o
+ proc-$(CONFIG_NET)		+= proc_net.o
+ proc-$(CONFIG_PROC_KCORE)	+= kcore.o
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 43731fe..d6c2ca5 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -498,6 +498,17 @@ struct sched_rt_entity {
+ #endif
+ } __randomize_layout;
+ 
++#ifdef CONFIG_SCHED_SJF_POLICY
++struct sched_sjf_entity {
++       unsigned int sjf_id;
++       unsigned long long rel_runtime;
++       unsigned long long absolute_runtime;
++
++       struct rb_node sjf_rb_node;
++       struct list_head sjf_list_node;
++};
++#endif
++
+ struct sched_dl_entity {
+ 	struct rb_node			rb_node;
+ 
+@@ -644,6 +655,9 @@ struct task_struct {
+ 	const struct sched_class	*sched_class;
+ 	struct sched_entity		se;
+ 	struct sched_rt_entity		rt;
++#ifdef CONFIG_SCHED_SJF_POLICY
++       struct sched_sjf_entity         sjf;
++#endif
+ #ifdef CONFIG_CGROUP_SCHED
+ 	struct task_group		*sched_task_group;
+ #endif
+diff --git a/include/uapi/linux/sched.h b/include/uapi/linux/sched.h
+index 22627f8..62f23e7 100644
+--- a/include/uapi/linux/sched.h
++++ b/include/uapi/linux/sched.h
+@@ -40,8 +40,7 @@
+ /* SCHED_ISO: reserved but not implemented yet */
+ #define SCHED_IDLE		5
+ #define SCHED_DEADLINE		6
+-
+-/* Can be ORed in to make sure the process is reverted back to SCHED_NORMAL on fork */
++#define SCHED_SJF               9
+ #define SCHED_RESET_ON_FORK     0x40000000
+ 
+ /*
+diff --git a/include/uapi/linux/sched/types.h b/include/uapi/linux/sched/types.h
+index 10fbb80..83e3bbe 100644
+--- a/include/uapi/linux/sched/types.h
++++ b/include/uapi/linux/sched/types.h
+@@ -70,6 +70,8 @@ struct sched_attr {
+ 	__u64 sched_runtime;
+ 	__u64 sched_deadline;
+ 	__u64 sched_period;
++        __u64 sjf_runtime;
++        __u64 sjf_id;
+ };
+ 
+ #endif /* _UAPI_LINUX_SCHED_TYPES_H */
+diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
+index d9a02b3..4d9b043 100644
+--- a/kernel/sched/Makefile
++++ b/kernel/sched/Makefile
+@@ -18,6 +18,7 @@ endif
+ 
+ obj-y += core.o loadavg.o clock.o cputime.o
+ obj-y += idle.o fair.o rt.o deadline.o
++obj-y += sched_sjf.o
+ obj-y += wait.o wait_bit.o swait.o completion.o
+ 
+ obj-$(CONFIG_SMP) += cpupri.o cpudeadline.o topology.o stop_task.o
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index fe365c9..2a1feb3 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3415,7 +3415,11 @@ static void __sched notrace __schedule(bool preempt)
+ 	struct rq_flags rf;
+ 	struct rq *rq;
+ 	int cpu;
+-
++        
++        #ifdef  CONFIG_SCHED_SJF_POLICY
++        /* Buffer for sjf to spritnf messages for event log */
++        char msg[SJF_MSG_SIZE];
++        #endif
+ 	cpu = smp_processor_id();
+ 	rq = cpu_rq(cpu);
+ 	prev = rq->curr;
+@@ -3475,7 +3479,19 @@ static void __sched notrace __schedule(bool preempt)
+ 	next = pick_next_task(rq, prev, &rf);
+ 	clear_tsk_need_resched(prev);
+ 	clear_preempt_need_resched();
++#ifdef  CONFIG_SCHED_SJF_POLICY
++/* If either task involved in schedule() is a casio task, log context_switch */
++        if(prev->policy==SCHED_SJF || next->policy==SCHED_SJF){
++               int prev_cid = prev->policy==SCHED_SJF?prev->sjf.sjf_id:-1;
++               int next_cid = next->policy==SCHED_SJF?next->sjf.sjf_id:-1;
++
++               snprintf(msg,SJF_MSG_SIZE,"prev->(cid%d:pid%d),next->(cid%d:pid%d)",
++                               prev_cid,prev->pid,next_cid,next->pid);
++                register_sjf_event(sched_clock(), msg, SJF_CONTEXT_SWITCH);
+ 
++
++        }
++#endif
+ 	if (likely(prev != next)) {
+ 		rq->nr_switches++;
+ 		rq->curr = next;
+@@ -4087,7 +4103,11 @@ static void __setscheduler_params(struct task_struct *p,
+ 
+ 	p->policy = policy;
+ 
+-	if (dl_policy(policy))
++	if (policy == SCHED_SJF) {
++                 p->sjf.sjf_id = attr->sjf_id;
++                 p->sjf.rel_runtime = attr->sjf_runtime;
++               /* Don't initialize list or rb tree node */
++       }else if (dl_policy(policy))
+ 		__setparam_dl(p, attr);
+ 	else if (fair_policy(policy))
+ 		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
+@@ -4116,7 +4136,9 @@ static void __setscheduler(struct rq *rq, struct task_struct *p,
+ 	if (keep_boost)
+ 		p->prio = rt_effective_prio(p, p->prio);
+ 
+-	if (dl_prio(p->prio))
++	if (p->policy == SCHED_SJF)
++                p->sched_class = &sjf_sched_class;
++        else if (dl_prio(p->prio))
+ 		p->sched_class = &dl_sched_class;
+ 	else if (rt_prio(p->prio))
+ 		p->sched_class = &rt_sched_class;
+@@ -6024,6 +6046,9 @@ void __init sched_init(void)
+ 		init_cfs_rq(&rq->cfs);
+ 		init_rt_rq(&rq->rt);
+ 		init_dl_rq(&rq->dl);
++#ifdef CONFIG_SCHED_SJF_POLICY
++               init_sjf_rq(&rq->sjf);
++#endif
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 		root_task_group.shares = ROOT_TASK_GROUP_LOAD;
+ 		INIT_LIST_HEAD(&rq->leaf_cfs_rq_list);
+@@ -6111,7 +6136,9 @@ void __init sched_init(void)
+ 	init_sched_fair_class();
+ 
+ 	init_schedstats();
+-
++#ifdef CONFIG_SCHED_SJF_POLICY
++       init_sjf_event_log();
++#endif
+ 	scheduler_running = 1;
+ }
+ 
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index c7742dc..4da8c2a 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -173,7 +173,7 @@ static inline int dl_policy(int policy)
+ static inline bool valid_policy(int policy)
+ {
+ 	return idle_policy(policy) || fair_policy(policy) ||
+-		rt_policy(policy) || dl_policy(policy);
++		rt_policy(policy) || dl_policy(policy) || policy == SCHED_SJF;
+ }
+ 
+ static inline int task_has_rt_policy(struct task_struct *p)
+@@ -729,7 +729,13 @@ struct root_domain {
+ 
+ 	unsigned long		max_cpu_capacity;
+ };
+-
++#ifdef CONFIG_SCHED_SJF_POLICY
++struct sjf_rq {
++       struct rb_root sjf_rb_root;
++       struct list_head sjf_list_head;
++       atomic_t nr_running;
++};
++#endif
+ extern struct root_domain def_root_domain;
+ extern struct mutex sched_domains_mutex;
+ 
+@@ -785,6 +791,10 @@ struct rq {
+ 	struct rt_rq		rt;
+ 	struct dl_rq		dl;
+ 
++#ifdef CONFIG_SCHED_SJF_POLICY
++       struct  sjf_rq           sjf;
++#endif
++
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	/* list of leaf cfs_rq on this CPU: */
+ 	struct list_head	leaf_cfs_rq_list;
+@@ -1547,14 +1557,13 @@ static inline void set_curr_task(struct rq *rq, struct task_struct *curr)
+ 	curr->sched_class->set_curr_task(rq);
+ }
+ 
+-#ifdef CONFIG_SMP
+-#define sched_class_highest (&stop_sched_class)
+-#else
+-#define sched_class_highest (&dl_sched_class)
+-#endif
++#define sched_class_highest (&sjf_sched_class)
+ #define for_each_class(class) \
+    for (class = sched_class_highest; class; class = class->next)
+ 
++#ifdef CONFIG_SCHED_SJF_POLICY
++extern const struct sched_class sjf_sched_class;
++#endif
+ extern const struct sched_class stop_sched_class;
+ extern const struct sched_class dl_sched_class;
+ extern const struct sched_class rt_sched_class;
+@@ -2053,6 +2062,9 @@ print_numa_stats(struct seq_file *m, int node, unsigned long tsf,
+ extern void init_cfs_rq(struct cfs_rq *cfs_rq);
+ extern void init_rt_rq(struct rt_rq *rt_rq);
+ extern void init_dl_rq(struct dl_rq *dl_rq);
++#ifdef CONFIG_SCHED_SJF_POLICY
++extern void init_sjf_rq(struct sjf_rq *sjf_rq);
++#endif
+ 
+ extern void cfs_bandwidth_usage_inc(void);
+ extern void cfs_bandwidth_usage_dec(void);
+@@ -2194,3 +2206,32 @@ static inline unsigned long cpu_util_cfs(struct rq *rq)
+ 	return util;
+ }
+ #endif
++#ifdef CONFIG_SCHED_SJF_POLICY
++
++/* Rolls its own logging system for events related to SJF */
++#define SJF_MSG_SIZE         400
++#define SJF_MAX_EVENT_LINES  10000
++
++#define SJF_ENQUEUE          1
++#define SJF_DEQUEUE          2
++#define SJF_CONTEXT_SWITCH   3
++#define SJF_MSG              4
++
++#define SJF_EVENT_CODE(i) ("?EDSM?????"[i])
++
++struct sjf_event{
++       int action;
++       unsigned long long timestamp;
++       char msg[SJF_MSG_SIZE];
++};
++
++struct sjf_event_log{
++       struct sjf_event sjf_event[SJF_MAX_EVENT_LINES];
++       unsigned long lines;
++       unsigned long cursor;
++};
++
++void init_sjf_event_log(void);
++struct sjf_event_log * get_sjf_event_log(void);
++void register_sjf_event(unsigned long long t, char *m, int a);
++#endif
